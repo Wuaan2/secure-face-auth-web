@@ -327,3 +327,32 @@ test('a paused attempt survives clean-up past its old step deadline until the ov
   f.create();
   assert.throws(() => f.challenges.resume(late, { sampleToken: f.token(late) }), /CHALLENGE_NOT_FOUND/);
 });
+
+test('frontal steps use the strict identity cutoff; only turned or tilted steps use the looser one', () => {
+  let time = 1000;
+  const engine = new FaceEngine(0.45);
+  engine.enroll({ accountId: 'alice', descriptor: descriptor() });
+  const challenges = new LivenessChallenges(engine, { now: () => time, random: () => 0, poseThreshold: 0.6 });
+  const near = pose => { const d = descriptor(); d[0] = 0.5; return { descriptor: d, landmarks: landmarks(pose) }; };
+  let state = challenges.create({ accountId: 'alice' }); // look_straight, turn_left, center, ...
+  const id = state.challengeId;
+  const send = pose => { time += 200; state = challenges.submit(id, { ...near(pose), sampleToken: state.sampleToken }); return state; };
+  // Distance 0.5 at a frontal step: above 0.45, so the attempt pauses for its one retry.
+  assert.equal(send({}).status, 'IDENTITY_RETRY');
+  assert.equal(state.threshold, 0.45);
+  state = challenges.resume(id, { sampleToken: state.sampleToken });
+  // Same distance while turning: within the 0.6 pose cutoff.
+  time += 200; state = challenges.submit(id, { descriptor: descriptor(), landmarks: landmarks(), sampleToken: state.sampleToken });
+  time += 200; state = challenges.submit(id, { descriptor: descriptor(), landmarks: landmarks(), sampleToken: state.sampleToken });
+  assert.equal(state.action, 'turn_left');
+  const turned = send({ noseOffset: -0.3 });
+  assert.equal(turned.status, 'CHALLENGE_ACTIVE');
+  assert.equal(turned.checks[0].target, 0.6);
+  assert.equal(turned.checks[0].pass, true);
+});
+
+test('pose threshold configuration is validated', () => {
+  for (const poseThreshold of [0, NaN, 3]) {
+    assert.throws(() => new LivenessChallenges(new FaceEngine(), { poseThreshold }), /Invalid liveness configuration/);
+  }
+});
