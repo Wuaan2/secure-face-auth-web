@@ -1,0 +1,160 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { WorkspaceUI } from '../public/js/workspace-ui.js';
+
+function fixture() {
+  const ids = ['camera-state', 'model-state', 'camera-placeholder', 'camera-stage', 'status-panel',
+    'status-heading', 'metric-distance', 'metric-threshold', 'metric-ear', 'metric-pose', 'metric-mouth', 'metrics-panel',
+    'result-placeholder', 'pose-fill', 'pose-readout', 'challenge-step', 'challenge-action', 'challenge-prompt',
+    'challenge-panel', 'challenge-timer', 'step-time', 'attempt-time', 'checks-panel', 'checks-title', 'checks-list'];
+  // Minimal element: textContent = '' clears children, append keeps them, text() flattens like the DOM.
+  const element = () => ({ dataset: {}, style: {}, hidden: false, max: 5, value: 0, className: '', children: [],
+    get textContent() { return this.children.map(c => (typeof c === 'string' ? c : c.textContent)).join('') || this.text || ''; },
+    set textContent(v) { this.children = []; this.text = v; },
+    append(...items) { this.children.push(...items); } });
+  const nodes = Object.fromEntries(ids.map(id => [id, element()]));
+  let now = 1000; let tick; let starts = 0; let stops = 0;
+  const ui = new WorkspaceUI({ createElement: element, getElementById: id => {
+    assert.ok(nodes[id], `Unknown UI element: ${id}`); return nodes[id];
+  } }, { now: () => now, setInterval: callback => { starts++; tick = callback; return starts; },
+    clearInterval: () => { stops++; tick = undefined; } });
+  return { ui, nodes, advance(ms) { now += ms; tick?.(); }, starts: () => starts, stops: () => stops };
+}
+const active = (overrides = {}) => ({ status: 'CHALLENGE_ACTIVE', totalSteps: 5, step: 0,
+  action: 'look_straight', prompt: 'Look straight ahead.', stepExpiresAt: 16000, expiresAt: 46000, ...overrides });
+
+test('device indicators reflect actual state, without inferring enrollment or authentication', () => {
+  const { ui, nodes } = fixture();
+  ui.setDevices({ cameraActive: false, modelsReady: true, busy: false });
+  assert.equal(nodes['camera-state'].textContent, 'Camera off');
+  assert.equal(nodes['camera-placeholder'].hidden, false);
+  assert.equal(nodes['model-state'].dataset.state, 'ready');
+  ui.setDevices({ cameraActive: true, modelsReady: true, busy: true });
+  assert.equal(nodes['camera-placeholder'].hidden, true);
+  assert.equal(nodes['camera-stage'].dataset.active, 'true');
+  assert.equal(nodes['camera-stage'].dataset.busy, 'true');
+});
+
+test('status distinguishes identity matching from a completed challenge login', () => {
+  const { ui, nodes } = fixture();
+  ui.setStatus('MATCH');
+  assert.equal(nodes['status-heading'].textContent, 'Identity match');
+  assert.equal(nodes['status-panel'].dataset.tone, 'success');
+  ui.setStatus('SEQUENCE_COMPLETE');
+  assert.equal(nodes['status-heading'].textContent, 'Logged in');
+  assert.equal(nodes['status-panel'].dataset.tone, 'success');
+  ui.setStatus('UNKNOWN_SERVER_ERROR');
+  assert.equal(nodes['status-panel'].dataset.tone, 'error');
+});
+
+test('metrics reject non-finite values and reset without retaining stale results', () => {
+  const { ui, nodes } = fixture();
+  ui.renderMetrics({ distance: 0.2142, threshold: 0.6, ear: NaN, noseOffset: Infinity });
+  assert.equal(nodes['metric-distance'].textContent, '0.2142');
+  assert.equal(nodes['metric-threshold'].textContent, '0.6000');
+  assert.equal(nodes['metric-ear'].textContent, '—');
+  assert.equal(nodes['metric-pose'].textContent, '—');
+  assert.equal(nodes['metrics-panel'].hidden, false);
+  ui.resetMetrics();
+  assert.equal(nodes['metrics-panel'].hidden, true);
+  assert.equal(nodes['result-placeholder'].hidden, false);
+  assert.equal(nodes['metric-distance'].textContent, '—');
+});
+
+test('countdown uses returned deadlines, advances steps without extra intervals, and never decides a result', () => {
+  const f = fixture();
+  f.ui.updateChallenge(active());
+  assert.equal(f.nodes['step-time'].textContent, '15s');
+  assert.equal(f.nodes['attempt-time'].textContent, '45s');
+  f.advance(1100);
+  assert.equal(f.nodes['step-time'].textContent, '14s');
+  f.ui.updateChallenge(active({ step: 1, action: 'tilt_left', stepExpiresAt: 17000 }));
+  assert.equal(f.starts(), 1);
+  assert.equal(f.nodes['challenge-step'].textContent, 'Step 2 of 5');
+  assert.equal(f.nodes['challenge-action'].textContent, 'Face screen, tilt to right shoulder');
+  f.advance(15000);
+  assert.equal(f.nodes['step-time'].textContent, '0s');
+  assert.equal(f.nodes['challenge-panel'].dataset.state, 'active');
+  assert.equal(f.nodes['challenge-step'].textContent, 'Step 2 of 5');
+});
+
+test('completion and reset clear timers; identity failure retains the known step without NaN', () => {
+  const f = fixture();
+  f.ui.updateChallenge(active());
+  f.ui.updateChallenge({ status: 'SEQUENCE_COMPLETE', totalSteps: 5, step: 5, prompt: 'PoC sequence completed.' });
+  assert.equal(f.stops(), 1);
+  assert.equal(f.nodes['challenge-step'].textContent, 'Sequence complete');
+  assert.equal(f.nodes['challenge-timer'].hidden, true);
+  f.ui.updateChallenge(active({ step: 2, action: 'center', prompt: 'Look straight ahead.' }));
+  f.ui.updateChallenge({ status: 'NO_MATCH' });
+  assert.equal(f.stops(), 2);
+  assert.equal(f.nodes['challenge-panel'].dataset.state, 'failed');
+  assert.equal(f.nodes['challenge-step'].textContent, 'Identity mismatch · Step 3 of 5');
+  assert.equal(f.nodes['challenge-action'].textContent, 'Look straight, head upright');
+  assert.equal(f.nodes['challenge-prompt'].textContent, 'Look straight ahead.');
+  f.ui.updateChallenge(active({ action: 'future_action' }));
+  assert.equal(f.nodes['challenge-action'].textContent, 'Follow the current instruction');
+  f.ui.resetChallenge({ label: 'Cancelled' });
+  assert.equal(f.stops(), 3);
+  assert.equal(f.nodes['challenge-step'].textContent, 'Cancelled');
+  assert.equal(f.nodes['step-time'].textContent, '—');
+});
+
+test('local failure retains the last instruction and progress for recording the failed step', () => {
+  const { ui, nodes } = fixture();
+  ui.failChallenge('Attempt ended');
+  assert.equal(nodes['challenge-step'].textContent, 'Attempt ended');
+  ui.updateChallenge(active({ step: 3, action: 'turn_right', prompt: 'Turn right in the preview.' }));
+  ui.failChallenge('Capture failed');
+  assert.equal(nodes['challenge-panel'].dataset.state, 'failed');
+  assert.equal(nodes['challenge-step'].textContent, 'Capture failed · Step 4 of 5');
+  assert.equal(nodes['challenge-prompt'].textContent, 'Turn right in the preview.');
+  assert.equal(nodes['challenge-timer'].hidden, true);
+});
+
+test('server requirements render as "value / op target" with only the value colored by pass or fail', () => {
+  const { ui, nodes } = fixture();
+  ui.renderMetrics({ distance: 0.31, ear: 0.3, checksFor: 'tilt_left', checks: [
+    { label: 'Head tilt (°)', value: 10.04, op: '≥', target: 12, pass: false },
+    { label: 'Head tilt (°)', value: 15.2, op: '≥', target: 12, pass: true },
+    { label: 'Identity distance', value: 0.31, op: '≤', target: 0.6, pass: true },
+    { label: 'Broken', value: NaN, op: '≥', target: 1, pass: false }] });
+  assert.equal(nodes['checks-panel'].hidden, false);
+  assert.equal(nodes['checks-title'].textContent, 'Server requirements · Face screen, tilt to right shoulder');
+  const rows = nodes['checks-list'].children;
+  assert.equal(rows.length, 3); // non-finite values are not rendered
+  const [failing, passing, identity] = rows.map(row => row.children[1]);
+  assert.equal(failing.textContent, '10.0 / ≥ 12.0');
+  assert.equal(failing.children[0].className, 'fail');
+  assert.equal(passing.textContent, '15.2 / ≥ 12.0');
+  assert.equal(passing.children[0].className, 'pass');
+  assert.equal(identity.textContent, '0.310 / ≤ 0.600');
+  assert.equal(rows[0].children[0].textContent, 'Head tilt (°)');
+  ui.resetMetrics();
+  assert.equal(nodes['checks-panel'].hidden, true);
+  assert.equal(nodes['checks-list'].children.length, 0);
+});
+
+test('the pose meter fills toward the requested side from the server checks', () => {
+  const { ui, nodes } = fixture();
+  const tilt = (value, pass) => active({ action: 'tilt_left', checksFor: 'tilt_left', checks: [
+    { label: 'Identity distance', value: 0.3, op: '≤', target: 0.6, pass: true },
+    { label: 'Eyes open (EAR)', value: 0.3, op: '≥', target: 0.25, pass: true },
+    { label: 'Turn, keep below (|nose offset|)', value: 0.02, op: '<', target: 0.15, pass: true },
+    { label: 'Head tilt (°)', value, op: '≥', target: 12, pass }] });
+  ui.updateChallenge(tilt(6, false)); // tilt_left = the user's right shoulder: fills rightward, half way
+  assert.deepEqual([nodes['pose-fill'].style.left, nodes['pose-fill'].style.width], ['50%', '25%']);
+  assert.equal(nodes['pose-fill'].dataset.pass, 'false');
+  assert.equal(nodes['pose-readout'].textContent, '6.0 / ≥ 12.0');
+  assert.equal(nodes['pose-readout'].children[0].className, 'fail');
+  ui.updateChallenge(tilt(15, true));
+  assert.deepEqual([nodes['pose-fill'].style.left, nodes['pose-fill'].style.width], ['50%', '50%']);
+  assert.equal(nodes['pose-fill'].dataset.pass, 'true');
+  ui.updateChallenge(active({ action: 'turn_right', checksFor: 'turn_right', checks: [
+    { label: 'Turn (nose offset)', value: 0.075, op: '≥', target: 0.15, pass: false }] }));
+  assert.deepEqual([nodes['pose-fill'].style.left, nodes['pose-fill'].style.width], ['25%', '25%']); // leftward
+  // Checks from the previous action (the step just advanced) leave the new action's meter empty.
+  ui.updateChallenge(active({ action: 'center', checksFor: 'turn_right', checks: [] }));
+  assert.equal(nodes['pose-fill'].style.width, '0%');
+  assert.equal(nodes['pose-readout'].textContent, '—');
+});

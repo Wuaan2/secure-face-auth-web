@@ -1,0 +1,148 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import { createApp } from '../src/app.js';
+import { FaceEngine, validatePayload } from '../src/services/face-engine.js';
+import { readConfig } from '../src/config.js';
+import { syntheticAnalyzer, syntheticFrame } from './synthetic-analyzer.js';
+
+const vector = (value = 0) => Array(128).fill(value); // Synthetic numbers, no real biometrics.
+const payload = (accountId = 'alice', value = 0) => ({ accountId, descriptor: vector(value) });
+// HTTP bodies: the browser sends frames; the synthetic analyzer turns them back into these vectors.
+const frame = (value = 0) => syntheticFrame({ descriptor: vector(value), landmarks: [] });
+const enrollBody = (accountId = 'alice', value = 0) => ({ accountId, frames: [frame(value), frame(value), frame(value)] });
+const verifyBody = (accountId = 'alice', value = 0) => ({ accountId, frame: frame(value) });
+
+async function fixture(t, config = {}) {
+  const server = createApp({ analyzer: syntheticAnalyzer, ...config }).listen(0, '127.0.0.1');
+  await new Promise(resolve => server.once('listening', resolve));
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const post = (path, body, headers = {}) => fetch(`${base}/api/${path}`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json', ...headers },
+    body: typeof body === 'string' ? body : JSON.stringify(body)
+  });
+  return { base, post };
+}
+
+test('backend starts, health and frontend/assets work with security headers', async t => {
+  const { base } = await fixture(t);
+  const res = await fetch(`${base}/api/health`);
+  assert.equal(res.status, 200);
+  assert.equal((await res.json()).status, 'ok');
+  assert.match(res.headers.get('content-security-policy'), /frame-ancestors 'none'/);
+  assert.match(res.headers.get('permissions-policy'), /camera=\(self\)/);
+  assert.equal(res.headers.get('x-content-type-options'), 'nosniff');
+  assert.equal(res.headers.get('cache-control'), 'no-store');
+  assert.equal(res.headers.get('x-powered-by'), null);
+  for (const path of ['/', '/account.html', '/js/app.js', '/js/account.js', '/js/camera.js', '/js/face-client.js', '/js/workspace-ui.js', '/style.css', '/vendor/face-api.min.js']) {
+    assert.equal((await fetch(base + path)).status, 200, path);
+  }
+  assert.equal((await fetch(base + '/.env')).status, 404);
+});
+
+test('reject client-sent descriptors, malformed frames and bad account IDs', async t => {
+  const { post } = await fixture(t);
+  // The old protocol (client-computed descriptor) is no longer accepted at all.
+  assert.equal((await post('templates', payload())).status, 400);
+  assert.equal((await post('verify', payload())).status, 400);
+  for (const frames of [undefined, null, 'face', {}, [], [frame()], [frame(), frame()], Array(6).fill(frame()),
+    ['data:image/jpeg;base64,AAAA', frame(), frame()]]) {
+    assert.equal((await post('templates', { accountId: 'alice', frames })).status, 400);
+  }
+  for (const descriptor of [vector().slice(1), vector().map(() => 11)]) {
+    const bad = syntheticFrame({ descriptor });
+    assert.equal((await post('templates', { accountId: 'alice', frames: [bad, bad, bad] })).status, 400);
+  }
+  for (const accountId of ['', '../alice', 'a b', 'x'.repeat(65), {}, null]) {
+    assert.equal((await post('templates', enrollBody(accountId))).status, 400);
+  }
+  const none = syntheticFrame({ face: 'none' });
+  assert.equal((await post('templates', { accountId: 'alice', frames: [none, none, none] })).status, 422);
+  const inconsistent = await post('templates', { accountId: 'alice', frames: [frame(0), frame(0), frame(1)] });
+  assert.equal(inconsistent.status, 422);
+  assert.equal((await inconsistent.json()).status, 'INCONSISTENT_FRAMES');
+});
+
+test('an occupied port reports the startup problem without a secondary TypeError', async t => {
+  const { base } = await fixture(t);
+  const result = spawnSync(process.execPath, ['src/server.js'], {
+    env: { ...process.env, HOST: '127.0.0.1', PORT: new URL(base).port },
+    encoding: 'utf8', timeout: 10000
+  });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /EADDRINUSE/);
+  assert.doesNotMatch(result.stderr, /TypeError/);
+});
+
+test('NaN and Infinity are rejected directly and as invalid or overflowing JSON', async t => {
+  for (const value of [NaN, Infinity, -Infinity]) {
+    const descriptor = vector(); descriptor[0] = value;
+    assert.throws(() => validatePayload({ accountId: 'alice', descriptor }), /INVALID_DESCRIPTOR/);
+  }
+  const { post } = await fixture(t);
+  for (const token of ['NaN', 'Infinity', '-Infinity', '1e400', 'null']) {
+    const body = `{"accountId":"alice","descriptor":[${token},${vector().slice(1).join(',')}]}`;
+    assert.equal((await post('templates', body)).status, 400);
+  }
+});
+
+test('payload, content-type, query and cross-site limits fail safely', async t => {
+  const { post } = await fixture(t);
+  assert.equal((await post('templates', { ...enrollBody(), padding: 'x'.repeat(1_100_000) })).status, 413);
+  assert.equal((await post('liveness/challenges', { accountId: 'alice', padding: 'x'.repeat(10000) })).status, 413);
+  assert.equal((await post('templates', enrollBody(), { 'Content-Type': 'text/plain' })).status, 415);
+  assert.equal((await post('templates?descriptor=forbidden', enrollBody())).status, 400);
+  assert.equal((await post('templates', enrollBody(), { 'Sec-Fetch-Site': 'cross-site' })).status, 403);
+});
+
+test('cannot force a match using client result flags', async t => {
+  const { post } = await fixture(t);
+  await post('templates', enrollBody());
+  for (const flag of ['matched', 'authenticated', 'distance', 'threshold', 'livenessPassed', 'descriptor']) {
+    assert.equal((await post('verify', { ...verifyBody('alice', 1), [flag]: true })).status, 400);
+  }
+  const res = await post('verify', verifyBody('alice', 1));
+  const result = await res.json();
+  assert.equal(result.matched, false);
+  assert.equal(result.authenticated, false);
+  assert.equal(res.headers.get('set-cookie'), null);
+});
+
+test('no template fails safely; enrollment and 1:1 distance match correctly', async t => {
+  const { post } = await fixture(t);
+  assert.equal((await post('verify', verifyBody())).status, 404);
+  assert.equal((await post('templates', enrollBody())).status, 201);
+  const result = await (await post('verify', verifyBody())).json();
+  assert.equal(result.distance, 0);
+  assert.equal(result.matched, true);
+  assert.equal(result.authenticated, false);
+  assert.equal(result.liveness, 'NOT_IMPLEMENTED');
+  assert.equal((await post('verify', verifyBody('bob'))).status, 404);
+  assert.equal((await post('templates', enrollBody())).status, 409);
+  const mismatch = await (await post('verify', verifyBody('alice', 0.1))).json();
+  assert.ok(mismatch.distance > mismatch.threshold);
+  assert.equal(mismatch.matched, false);
+});
+
+test('templates are copied, bounded and isolated to server instance RAM', () => {
+  const first = new FaceEngine(0.6, 1);
+  const data = payload(); first.enroll(data); data.descriptor[0] = 1;
+  assert.equal(first.verify(payload()).distance, 0);
+  assert.throws(() => first.enroll(payload('bob')), /TEMPLATE_CAPACITY/);
+  assert.throws(() => new FaceEngine().verify(payload()), /NO_TEMPLATE/);
+});
+
+test('threshold comes from validated config and boundary uses <=', () => {
+  assert.equal(readConfig({ FACE_MATCH_THRESHOLD: '0.4' }).threshold, 0.4);
+  assert.equal(readConfig({ LIVENESS_STEP_TIMEOUT_MS: '9000' }).liveness.stepTimeoutMs, 9000);
+  assert.throws(() => createApp(readConfig({ LIVENESS_STEP_TIMEOUT_MS: 'NaN' })), /Invalid liveness configuration/);
+  for (const value of ['NaN', 'Infinity', '0', '-1', '3', '']) {
+    assert.throws(() => readConfig({ FACE_MATCH_THRESHOLD: value }));
+  }
+  const engine = new FaceEngine(0.5); engine.enroll(payload());
+  const probe = payload(); probe.descriptor[0] = 0.5;
+  assert.equal(engine.verify(probe).matched, true);
+  probe.descriptor[0] = 0.50001;
+  assert.equal(engine.verify(probe).matched, false);
+});

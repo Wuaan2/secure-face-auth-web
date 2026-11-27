@@ -1,0 +1,20 @@
+export function readConfig(env = process.env) {
+  const threshold = Number(env.FACE_MATCH_THRESHOLD ?? '0.45');
+  const port = Number(env.PORT ?? '3000');
+  if (!Number.isFinite(threshold) || threshold <= 0 || threshold > 2) {
+    throw new Error('FACE_MATCH_THRESHOLD must be finite and in (0, 2].');
+  }
+  if (!Number.isInteger(port) || port < 0 || port > 65535) {
+    throw new Error('PORT must be an integer in [0, 65535].');
+  }
+  return { threshold, port, host: env.HOST ?? '127.0.0.1', dataDir: env.DATA_DIR ?? 'data', liveness: {
+    timeoutMs: Number(env.LIVENESS_TIMEOUT_MS ?? '90000'),
+    stepTimeoutMs: Number(env.LIVENESS_STEP_TIMEOUT_MS ?? '20000'),
+    eyeOpen: Number(env.LIVENESS_EYE_OPEN ?? '0.25'),
+    headTiltDeg: Number(env.LIVENESS_HEAD_TILT_DEG ?? '12'),
+    headLevelDeg: Number(env.LIVENESS_HEAD_LEVEL_DEG ?? '6'),
+    headTurn: Number(env.LIVENESS_HEAD_TURN ?? '0.15'),
+    headCenter: Number(env.LIVENESS_HEAD_CENTER ?? '0.10'),
+    poseThreshold: Number(env.FACE_POSE_THRESHOLD ?? '0.6')
+  } };
+}
